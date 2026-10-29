@@ -84,3 +84,7 @@ Pra qualquer legenda que vai ao ar, use `--verificar` e leia o diff.
 ## Repos relacionados
 
 Parte do kit do [@SafeMantella](https://github.com/SafeMantella): usado pelo [video-cut-pipeline](https://github.com/SafeMantella/video-cut-pipeline); o `.leitura.txt` é o que o [token-kit](https://github.com/SafeMantella/token-kit) prefere ler. Áudio limpo transcreve melhor: veja [Adobe-Podcast-for-Claude-Code](https://github.com/SafeMantella/Adobe-Podcast-for-Claude-Code).
+
+## Licença
+
+MIT. Veja [LICENSE](LICENSE).
