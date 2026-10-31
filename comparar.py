@@ -67,7 +67,7 @@ def main() -> None:
     else:
         print("Cada bloco acima: re-transcreva a janela isolada pra decidir quem está certo.")
         print("  ffmpeg -ss <t-2> -t <dur+4> -i video.mp4 -ar 16000 -ac 1 j.wav")
-        print("  whisper-cli -m <modelo> -l pt -nt j.wav")
+        print("  python3 transcrever.py j.wav -o j.json && cat j.leitura.txt")
 
 
 if __name__ == "__main__":

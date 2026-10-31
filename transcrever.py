@@ -1,13 +1,16 @@
-"""Transcrição local confiável (pt-BR, Apple Silicon) — 3 motores + verificação cruzada.
+"""Transcrição local confiável (pt-BR) via VoiceStudio — 3 motores + verificação cruzada.
 
 Padrão: --motor whisperx (transcreve o texto num passe e alinha palavra por
 palavra com Wav2vec2). Foi o único dos quatro caminhos testados em 10/09/2026
 que devolveu o áudio inteiro sem perder fala. Ver memory/diretrizes-transcricao.md
 pra medição completa e pra quando usar cada motor.
 
+Os motores rodam no VoiceStudio (servidor local, http://127.0.0.1:3900) — ver
+voicestudio.py pro mapa motor -> engine. Nenhum modelo nem venv aqui.
+
     python3 transcrever.py video.mp4 -o saida.json                # whisperx (padrão)
-    python3 transcrever.py video.mp4 -o saida.json --motor janela # whisper.cpp deslizante
-    python3 transcrever.py video.mp4 -o saida.json --motor vad    # whisper.cpp + VAD
+    python3 transcrever.py video.mp4 -o saida.json --motor janela # faster-whisper deslizante
+    python3 transcrever.py video.mp4 -o saida.json --motor vad    # faster-whisper + Silero VAD
     python3 transcrever.py video.mp4 -o saida.json --verificar    # roda 2 motores e diffa
 
 Saída: {"words": [{"text", "start", "end"}, ...]} — mesmo formato que o resto do
@@ -15,16 +18,12 @@ pipeline (pack_transcripts.py, render.py, build de legenda) já espera.
 """
 from __future__ import annotations
 
-import argparse, json, os, subprocess, sys, tempfile
+import argparse, json, subprocess, sys, tempfile
 from pathlib import Path
 
-AQUI = Path(__file__).resolve().parent
-VENV_PY = AQUI / "venv" / "bin" / "python"
+from voicestudio import motor_ativo, transcrever_wav
 
-BIN = os.environ.get("WHISPER_CPP_BIN", "/Volumes/1TB Mac/whisper.cpp/build/bin/whisper-cli")
-MODEL = os.environ.get("WHISPER_CPP_MODEL", "/Volumes/1TB Mac/whisper.cpp/models/ggml-large-v3.bin")
-VAD_MODEL = os.environ.get("WHISPER_VAD_MODEL", "/Volumes/1TB Mac/whisper.cpp/models/ggml-silero-v5.1.2.bin")
-DTW = {"large-v3-turbo": "large.v3.turbo", "large-v3": "large.v3"}
+AQUI = Path(__file__).resolve().parent
 
 WIN, HOP = 24.0, 18.0   # janela deslizante: 24s de janela, 6s de sobreposição
 
@@ -48,87 +47,32 @@ def duration(src: Path) -> float:
     return float(out.stdout.strip())
 
 
-def dtw_preset() -> str | None:
-    name = Path(MODEL).stem.lower()
-    return next((p for n, p in DTW.items() if n in name), None)
+def avisar_faltando(words: list[dict], texto: str) -> None:
+    """O VoiceStudio descarta palavra que o alinhador deixou sem tempo (número, símbolo)."""
+    falta = len(texto.split()) - len(words)
+    if falta > 0:
+        print(f"  ATENÇÃO (texto): {falta} palavra(s) do texto sem timestamp ficaram de fora — "
+              "conferir número/sigla no comparar.py", file=sys.stderr)
 
 
-def words_from_tokens(transcription: list[dict]) -> list[dict]:
-    """Token stream do whisper.cpp -> palavras (token com espaço à esquerda abre palavra)."""
-    points = []
-    for seg in transcription:
-        for tok in seg.get("tokens", []):
-            text = tok.get("text", "")
-            if not text or text.startswith("[_"):
-                continue
-            t_dtw = tok.get("t_dtw", -1)
-            t = t_dtw / 100.0 if (t_dtw is not None and t_dtw >= 0) \
-                else tok.get("offsets", {}).get("from", 0) / 1000.0
-            points.append((text, t))
-    words = []
-    for text, t in points:
-        if text.startswith(" ") or not words:
-            words.append({"text": text.strip(), "start": t, "end": t})
-        else:
-            words[-1]["text"] += text
-    for i in range(len(words) - 1):
-        words[i]["end"] = min(words[i + 1]["start"], words[i]["start"] + 2.0)
-    if words:
-        words[-1]["end"] = words[-1]["start"] + 0.4
-    return [w for w in words if w["text"]]
-
-
-def whisper_cpp(wav: Path, language: str, vad: bool) -> list[dict]:
-    with tempfile.TemporaryDirectory() as tmp:
-        stem = Path(tmp) / "out"
-        cmd = [BIN, "-m", MODEL, "-f", str(wav), "-l", language,
-               "-ojf", "-of", str(stem), "-np", "-nt"]
-        if (p := dtw_preset()):
-            cmd += ["-dtw", p]
-        if vad and Path(VAD_MODEL).exists():
-            # -vp 500: o padrão (30ms) come a primeira/última palavra de cada
-            # segmento de fala. Medido no vídeo "3 skills", não chutado.
-            cmd += ["--vad", "-vm", VAD_MODEL, "-vt", "0.35", "-vp", "500",
-                    "-vsd", "300", "-vo", "0.4"]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"whisper-cli falhou: {r.stderr[-800:]}")
-        raw = json.loads(Path(str(stem) + ".json").read_text())
-    return words_from_tokens(raw.get("transcription", []))
+def motor_arquivo(src: Path, language: str, motor: str) -> list[dict]:
+    with tempfile.TemporaryDirectory() as tmp, motor_ativo(motor):
+        wav = Path(tmp) / "full.wav"
+        to_wav(src, wav)
+        words, texto = transcrever_wav(wav, language)
+    avisar_faltando(words, texto)
+    return words
 
 
 # ------------------------------------------------------------------- motores
 
 def motor_whisperx(src: Path, language: str) -> list[dict]:
-    """Melhor resultado medido. Precisa do venv (ver README)."""
-    if not VENV_PY.exists():
-        raise SystemExit(f"venv não encontrado em {VENV_PY} — ver ferramentas/transcrever/README.md")
-    with tempfile.TemporaryDirectory() as tmp:
-        wav = Path(tmp) / "full.wav"
-        to_wav(src, wav)
-        out = Path(tmp) / "wx.json"
-        script = f'''
-import json, whisperx
-audio = whisperx.load_audio({str(wav)!r})
-m = whisperx.load_model("large-v3", "cpu", compute_type="int8", language={language!r})
-r = m.transcribe(audio, batch_size=8)
-am, meta = whisperx.load_align_model(language_code={language!r}, device="cpu")
-r = whisperx.align(r["segments"], am, meta, audio, "cpu", return_char_alignments=False)
-ws = [{{"text": w["word"], "start": round(w.get("start", 0), 2), "end": round(w.get("end", 0), 2)}}
-      for s in r["segments"] for w in s.get("words", [])]
-json.dump(ws, open({str(out)!r}, "w"), ensure_ascii=False)
-'''
-        r = subprocess.run([str(VENV_PY), "-c", script], capture_output=True, text=True)
-        if not out.exists():
-            raise RuntimeError(f"whisperx falhou:\n{r.stderr[-1500:]}")
-        return json.loads(out.read_text())
+    """Melhor resultado medido."""
+    return motor_arquivo(src, language, "whisperx")
 
 
 def motor_vad(src: Path, language: str) -> list[dict]:
-    with tempfile.TemporaryDirectory() as tmp:
-        wav = Path(tmp) / "full.wav"
-        to_wav(src, wav)
-        return whisper_cpp(wav, language, vad=True)
+    return motor_arquivo(src, language, "vad")
 
 
 def cut_point(prev: list[dict], nxt: list[dict], lo: float, hi: float) -> float:
@@ -144,7 +88,7 @@ def cut_point(prev: list[dict], nxt: list[dict], lo: float, hi: float) -> float:
 def motor_janela(src: Path, language: str) -> list[dict]:
     total = duration(src)
     merged: list[dict] = []
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, motor_ativo("vad"):
         start, i = 0.0, 0
         while start < total:
             dur = min(WIN, total - start)
@@ -152,7 +96,7 @@ def motor_janela(src: Path, language: str) -> list[dict]:
             to_wav(src, wav, start, dur)
             words = [{"text": w["text"], "start": round(w["start"] + start, 2),
                       "end": round(w["end"] + start, 2)}
-                     for w in whisper_cpp(wav, language, vad=False)]
+                     for w in transcrever_wav(wav, language)[0]]
             if not merged:
                 merged = words
             else:
